@@ -1,35 +1,39 @@
 import os
-import smtplib
-import ssl
 import threading
-from email.message import EmailMessage
+
+import requests
 
 from app.services.email_templates import render_task_created, render_task_completed
 
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 465  # SSL
+BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 
 
 def send_email(to: str, subject: str, html_body: str) -> None:
-    """Send one email through Gmail SMTP using an App Password."""
-    sender = os.getenv("GMAIL_SENDER")
-    password = (os.getenv("GMAIL_APP_PASSWORD") or "").replace(" ", "")
+    """Send one email through Brevo's HTTPS API (works on Render's free plan)."""
+    api_key = os.getenv("BREVO_API_KEY")
+    sender = os.getenv("MAIL_SENDER")
 
-    missing = [n for n, v in (("GMAIL_SENDER", sender), ("GMAIL_APP_PASSWORD", password)) if not v]
+    missing = [n for n, v in (("BREVO_API_KEY", api_key), ("MAIL_SENDER", sender)) if not v]
     if missing:
         raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
-    msg = EmailMessage()
-    msg["To"] = to
-    msg["From"] = f"TaskFlow <{sender}>"
-    msg["Subject"] = subject
-    msg.set_content("Please view this email in an HTML-capable client.")  # plain-text fallback
-    msg.add_alternative(html_body, subtype="html")
-
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=20) as server:
-        server.login(sender, password)
-        server.send_message(msg)
+    resp = requests.post(
+        BREVO_URL,
+        headers={
+            "api-key": api_key.strip(),
+            "accept": "application/json",
+            "content-type": "application/json",
+        },
+        json={
+            "sender": {"name": "TaskFlow", "email": sender.strip()},
+            "to": [{"email": to}],
+            "subject": subject,
+            "htmlContent": html_body,
+        },
+        timeout=15,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Brevo error {resp.status_code}: {resp.text}")
 
 
 def _send_safe(to: str, subject: str, html_body: str) -> None:
