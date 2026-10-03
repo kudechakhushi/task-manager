@@ -1,63 +1,87 @@
-import base64
+import os
+import smtplib
+import ssl
 import threading
-from email.mime.text import MIMEText
+from email.message import EmailMessage
 
-import requests
-from markupsafe import escape
+from app.services.email_templates import render_task_created, render_task_completed
 
-from app.config import Config
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465  # SSL
 
-def _get_access_token():
-    # Exchange the long-lived refresh token for a short-lived access token
-    r = requests.post("https://oauth2.googleapis.com/token", data={
-        "client_id": Config.GOOGLE_CLIENT_ID,
-        "client_secret": Config.GOOGLE_CLIENT_SECRET,
-        "refresh_token": Config.GMAIL_REFRESH_TOKEN,
-        "grant_type": "refresh_token",
-    }, timeout=10)
-    r.raise_for_status()
-    return r.json()["access_token"]
 
-def _send(recipients, subject, html):
-    recipients = list({r for r in recipients if r})
-    if not recipients:
-        return
+def send_email(to: str, subject: str, html_body: str) -> None:
+    """Send one email through Gmail SMTP using an App Password."""
+    sender = os.getenv("GMAIL_SENDER")
+    password = (os.getenv("GMAIL_APP_PASSWORD") or "").replace(" ", "")
 
-    def worker():
-        try:
-            msg = MIMEText(html, "html")
-            msg["to"] = ", ".join(recipients)
-            msg["from"] = Config.GMAIL_SENDER
-            msg["subject"] = subject
-            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-            requests.post(
-                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-                headers={"Authorization": f"Bearer {_get_access_token()}"},
-                json={"raw": raw},
-                timeout=10,
-            ).raise_for_status()
-        except Exception as e:
-            print("Email failed:", e)   # a failed email must not break the API
+    missing = [n for n, v in (("GMAIL_SENDER", sender), ("GMAIL_APP_PASSWORD", password)) if not v]
+    if missing:
+        raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
-    threading.Thread(target=worker, daemon=True).start()
+    msg = EmailMessage()
+    msg["To"] = to
+    msg["From"] = f"TaskFlow <{sender}>"
+    msg["Subject"] = subject
+    msg.set_content("Please view this email in an HTML-capable client.")  # plain-text fallback
+    msg.add_alternative(html_body, subtype="html")
 
-def _name(user):
-    return user.get("name") or user["email"] if user else "Unassigned"
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=20) as server:
+        server.login(sender, password)
+        server.send_message(msg)
 
-def send_task_created_email(task, creator, assignee):
-    recipients = [creator["email"]] + ([assignee["email"]] if assignee else [])
-    html = f"""
-      <h2>New task: {escape(task['title'])}</h2>
-      <p>{escape(task.get('description') or '')}</p>
-      <p><b>Created by:</b> {escape(_name(creator))}<br>
-         <b>Assigned to:</b> {escape(_name(assignee))}<br>
-         <b>Priority:</b> {task['priority']}<br>
-         <b>Due:</b> {task.get('due_date') or 'Not set'}</p>"""
-    _send(recipients, f"New task: {task['title']}", html)
 
-def send_task_completed_email(task, creator, assignee, completed_by):
-    recipients = [creator["email"]] + ([assignee["email"]] if assignee else [])
-    html = f"""
-      <h2>Task completed: {escape(task['title'])}</h2>
-      <p>Marked complete by <b>{escape(_name(completed_by))}</b>.</p>"""
-    _send(recipients, f"Task completed: {task['title']}", html)
+def _send_safe(to: str, subject: str, html_body: str) -> None:
+    """An email failure must never break creating or completing a task."""
+    try:
+        send_email(to, subject, html_body)
+        print(f"[email] sent '{subject}' to {to}")
+    except Exception as e:
+        print(f"[email] FAILED to send to {to}: {e}")
+
+
+def _send_async(recipients: list[str], subject: str, html_body: str) -> None:
+    """Send each email in a background thread so the API responds quickly."""
+    for to in recipients:
+        threading.Thread(target=_send_safe, args=(to, subject, html_body), daemon=True).start()
+
+
+def _recipients(*users) -> list[str]:
+    """Collect unique email addresses, so one person never gets two copies."""
+    seen, out = set(), []
+    for u in users:
+        email = (u or {}).get("email")
+        if email and email not in seen:
+            seen.add(email)
+            out.append(email)
+    return out
+
+
+def notify_task_created(task: dict, creator: dict, assignee: dict | None) -> None:
+    subject, body = render_task_created(task, creator, assignee)
+    _send_async(_recipients(creator, assignee), subject, body)
+
+
+def notify_task_completed(task: dict, completed_by: dict, creator: dict, assignee: dict | None) -> None:
+    subject, body = render_task_completed(task, completed_by, creator, assignee)
+    _send_async(_recipients(creator, assignee), subject, body)
+
+
+if __name__ == "__main__":
+    # Quick test (run from the backend folder):
+    #   python -m app.services.email_service you@gmail.com
+    import sys
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    sample_task = {
+        "title": "Test task",
+        "description": "Checking that email works",
+        "priority": "high",
+        "due_date": "2026-10-09",
+    }
+    person = {"name": "Test User", "email": sys.argv[1]}
+    subject, body = render_task_created(sample_task, person, person)
+    send_email(sys.argv[1], subject, body)
+    print("sent")

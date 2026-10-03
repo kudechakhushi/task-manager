@@ -6,6 +6,7 @@ import { Task, User } from "@/lib/types";
 
 type View = "assigned" | "created";
 type StatusFilter = "all" | "pending" | "completed";
+type FormErrors = { title?: string; description?: string; dueDate?: string };
 
 const PRIORITY_STYLES: Record<string, string> = {
   high: "bg-red-50 text-red-700 ring-red-200",
@@ -29,6 +30,11 @@ function initials(name?: string | null) {
     .toUpperCase();
 }
 
+// Today as YYYY-MM-DD in local time, so it compares with date strings from the form and the API
+function todayString() {
+  return new Date().toLocaleDateString("en-CA");
+}
+
 export default function Dashboard() {
   const router = useRouter();
   const [me, setMe] = useState<User | null>(null);
@@ -42,11 +48,13 @@ export default function Dashboard() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
+  // Create-task form fields
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [assignedTo, setAssignedTo] = useState("");
   const [priority, setPriority] = useState("medium");
   const [dueDate, setDueDate] = useState("");
+  const [formErrors, setFormErrors] = useState<FormErrors>({});
 
   const loadTasks = useCallback(async () => {
     setLoading(true);
@@ -61,7 +69,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!localStorage.getItem("token")) {
-      router.replace("/");
+      router.replace("/login");
       return;
     }
     apiFetch<User>("/api/me").then(setMe).catch((e) => setError(e.message));
@@ -72,10 +80,8 @@ export default function Dashboard() {
     loadTasks();
   }, [loadTasks]);
 
-  // Today in local time as YYYY-MM-DD, so it compares with due_date strings
-  const today = new Date().toLocaleDateString("en-CA");
   const isOverdue = (t: Task) =>
-    t.status === "pending" && !!t.due_date && t.due_date < today;
+    t.status === "pending" && !!t.due_date && t.due_date < todayString();
 
   const stats = useMemo(
     () => ({
@@ -100,16 +106,35 @@ export default function Dashboard() {
     });
   }, [tasks, statusFilter, search]);
 
+  // Returns an object with one message per invalid field (empty object = form is valid)
+  function validateForm(): FormErrors {
+    const errs: FormErrors = {};
+    const t = title.trim();
+    if (!t) errs.title = "Task title is required";
+    else if (t.length < 3) errs.title = "Title must be at least 3 characters";
+    else if (t.length > 100) errs.title = "Title must be 100 characters or fewer";
+
+    if (description.length > 500) errs.description = "Description must be 500 characters or fewer";
+
+    if (dueDate && dueDate < todayString()) errs.dueDate = "Due date cannot be in the past";
+    return errs;
+  }
+
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
     setError("");
+
+    const errs = validateForm();
+    setFormErrors(errs);
+    if (Object.keys(errs).length > 0) return; // stop here if anything is invalid
+
     setSubmitting(true);
     try {
       await apiFetch("/api/tasks", {
         method: "POST",
         body: JSON.stringify({
-          title,
-          description,
+          title: title.trim(),
+          description: description.trim(),
           assigned_to: assignedTo,
           priority,
           due_date: dueDate,
@@ -120,6 +145,7 @@ export default function Dashboard() {
       setAssignedTo("");
       setPriority("medium");
       setDueDate("");
+      setFormErrors({});
       setShowForm(false);
       loadTasks();
     } catch (e) {
@@ -150,7 +176,7 @@ export default function Dashboard() {
 
   function logout() {
     localStorage.removeItem("token");
-    router.replace("/");
+    router.replace("/login");
   }
 
   const statCards = [
@@ -162,6 +188,8 @@ export default function Dashboard() {
 
   const inputClass =
     "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200";
+  const errorInputClass =
+    "w-full rounded-lg border border-red-400 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-red-500 focus:outline-none focus:ring-2 focus:ring-red-100";
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -250,34 +278,60 @@ export default function Dashboard() {
             </select>
           </div>
           <button
-            onClick={() => setShowForm((s) => !s)}
+            onClick={() => {
+              setShowForm((s) => !s);
+              setFormErrors({});
+            }}
             className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700"
           >
             {showForm ? "Close" : "+ New task"}
           </button>
         </div>
 
-        {/* Create form */}
+        {/* Create form (noValidate turns off the browser popups so our own messages show) */}
         {showForm && (
           <form
             onSubmit={handleCreate}
+            noValidate
             className="space-y-3 rounded-xl border border-slate-200 bg-white p-5 shadow-sm"
           >
             <h2 className="font-semibold">Create task</h2>
-            <input
-              className={inputClass}
-              placeholder="Title"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              required
-            />
-            <textarea
-              className={inputClass}
-              rows={3}
-              placeholder="Description"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
+
+            <div>
+              <input
+                className={formErrors.title ? errorInputClass : inputClass}
+                placeholder="Title"
+                value={title}
+                maxLength={120}
+                onChange={(e) => {
+                  setTitle(e.target.value);
+                  if (formErrors.title) setFormErrors((f) => ({ ...f, title: undefined }));
+                }}
+                aria-invalid={!!formErrors.title}
+              />
+              {formErrors.title && <p className="mt-1 text-xs text-red-600">{formErrors.title}</p>}
+            </div>
+
+            <div>
+              <textarea
+                className={formErrors.description ? errorInputClass : inputClass}
+                rows={3}
+                placeholder="Description (optional)"
+                value={description}
+                onChange={(e) => {
+                  setDescription(e.target.value);
+                  if (formErrors.description) setFormErrors((f) => ({ ...f, description: undefined }));
+                }}
+                aria-invalid={!!formErrors.description}
+              />
+              <div className="mt-1 flex justify-between text-xs">
+                <span className="text-red-600">{formErrors.description}</span>
+                <span className={description.length > 500 ? "text-red-600" : "text-slate-400"}>
+                  {description.length}/500
+                </span>
+              </div>
+            </div>
+
             <div className="grid gap-3 sm:grid-cols-3">
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-600">Assign to</label>
@@ -289,6 +343,7 @@ export default function Dashboard() {
                     </option>
                   ))}
                 </select>
+                <p className="mt-1 text-xs text-slate-500">Only people who have signed in once appear here.</p>
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-600">Priority</label>
@@ -300,9 +355,21 @@ export default function Dashboard() {
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-slate-600">Due date</label>
-                <input type="date" className={inputClass} value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+                <input
+                  type="date"
+                  className={formErrors.dueDate ? errorInputClass : inputClass}
+                  value={dueDate}
+                  min={todayString()}
+                  onChange={(e) => {
+                    setDueDate(e.target.value);
+                    if (formErrors.dueDate) setFormErrors((f) => ({ ...f, dueDate: undefined }));
+                  }}
+                  aria-invalid={!!formErrors.dueDate}
+                />
+                {formErrors.dueDate && <p className="mt-1 text-xs text-red-600">{formErrors.dueDate}</p>}
               </div>
             </div>
+
             <button
               disabled={submitting}
               className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
@@ -325,7 +392,7 @@ export default function Dashboard() {
             <p className="mt-1 text-sm text-slate-500">
               {search || statusFilter !== "all"
                 ? "Try changing your search or filter."
-                : "Click \"+ New task\" to create one."}
+                : 'Click "+ New task" to create one.'}
             </p>
           </div>
         ) : (
